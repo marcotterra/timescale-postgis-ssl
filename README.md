@@ -16,6 +16,17 @@ Since this could pose a problem for applications or services attempting to conne
 
 The Dockerfiles contained in this repository start with the `timescale/timescaledb-ha` image as base.  Then the `init-ssl.sh` script is copied into the `docker-entrypoint-initdb.d/` directory to be executed upon initialization.
 
+### Supported tags
+
+| Dockerfile | Base image (verified 2026-09-08) |
+| --- | --- |
+| `Dockerfile.pg17-ts2.17` | `timescale/timescaledb-ha:pg17-ts2.17` |
+| `Dockerfile.pg18-ts2.29` | `timescale/timescaledb-ha:pg18-ts2.29` (PostgreSQL 18.6, TimescaleDB 2.29.2, PostGIS 3.6.4) |
+
+### A note about PostgreSQL 18
+
+PostgreSQL 18 requires TimescaleDB >= 2.23, so the `pg18` image uses TimescaleDB 2.29 / PostGIS 3.6. Major-version upgrades need a fresh volume (or `pg_dumpall` / logical replication) — you cannot start a pg17 data directory on the pg18 image. `initdb` now enables data checksums by default, and `md5` password auth is deprecated in favor of SCRAM.
+
 #### Wrapper script
 
 You will see in the Dockerfiles that the `ENTRYPOINT` is replaced with a `wrapper.sh` script.  The only logic the wrapper executes is to `unset` the `PGHOST` environment variable prior to executing the default entrypoint.  This logic is specific to Railway and allows us to use the `PGHOST` environment variable to enable the Database View.

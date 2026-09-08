@@ -24,7 +24,7 @@ sudo mkdir -p "$SSL_DIR"
 sudo chown postgres:postgres "$SSL_DIR"
 
 # Generate self-signed 509v3 certificates
-# ref: https://www.postgresql.org/docs/16/ssl-tcp.html#SSL-CERTIFICATE-CREATION
+# ref: https://www.postgresql.org/docs/18/ssl-tcp.html#SSL-CERTIFICATE-CREATION
 
 openssl req -new -x509 -days "${SSL_CERT_DAYS:-820}" -nodes -text -out "$SSL_ROOT_CRT" -keyout "$SSL_ROOT_KEY" -subj "/CN=root-ca"
 

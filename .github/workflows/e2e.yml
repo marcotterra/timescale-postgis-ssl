@@ -139,3 +139,95 @@ jobs:
           name: e2e-upgrade-logs-${{ matrix.from }}-${{ matrix.to }}
           path: failure-artifacts
           retention-days: 14
+
+  # PostGIS flavor smoke (Q14 gate, MinIO-free): boots each -postgis image,
+  # asserts ssl + postgis/topology auto-init + vector installable, then runs
+  # a seeded 16->17 upgrade check with the postgis upgrade image. The full
+  # MinIO PITR suite (test/e2e.sh) stays lean-only until it is parameterized
+  # for flavor tags and the 18 parent mount — tracked as follow-up, not
+  # silently claimed here.
+  e2e-postgis-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    strategy:
+      fail-fast: false
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build flavor + upgrade images
+        run: |
+          set -euo pipefail
+          docker build -f Dockerfile.postgis.16 -t postgres-ssl-postgis:16-postgis .
+          docker build -f Dockerfile.postgis.17 -t postgres-ssl-postgis:17-postgis .
+          docker build -f Dockerfile.postgis.18 -t postgres-ssl-postgis:18-postgis .
+          docker build -f Dockerfile.upgrade.postgis \
+            --build-arg FROM_VERSION=16 --build-arg TO_VERSION=17 \
+            --build-arg POSTGIS_TO_TAG=17-3.5 \
+            -t postgres-upgrade-postgis:16-17 .
+
+      - name: Boot assert (ssl + postgis + vector)
+        run: |
+          set -euo pipefail
+          wait_ready() {
+            local c="$1"
+            for _ in $(seq 1 30); do
+              docker exec "$c" pg_isready -U postgres >/dev/null 2>&1 && return 0
+              sleep 2
+            done
+            echo "timed out waiting for $c"; docker logs --tail 50 "$c" || true
+            return 1
+          }
+          # 16/17 mount the data dir; 18 mounts the parent (Q10b).
+          docker run -d --name smoke16 -e POSTGRES_PASSWORD=x -e POSTGRES_USER=postgres \
+            -v smoke16-vol:/var/lib/postgresql/data postgres-ssl-postgis:16-postgis
+          docker run -d --name smoke17 -e POSTGRES_PASSWORD=x -e POSTGRES_USER=postgres \
+            -v smoke17-vol:/var/lib/postgresql/data postgres-ssl-postgis:17-postgis
+          docker run -d --name smoke18 -e POSTGRES_PASSWORD=x -e POSTGRES_USER=postgres \
+            -v smoke18-vol:/var/lib/postgresql postgres-ssl-postgis:18-postgis
+          wait_ready smoke16; wait_ready smoke17; wait_ready smoke18
+          for c in smoke16 smoke17 smoke18; do
+            docker exec "$c" psql -U postgres -tAc "SHOW ssl;" | grep -qx "on"
+            docker exec "$c" psql -U postgres -tAc \
+              "SELECT count(*) FROM pg_extension WHERE extname IN ('postgis','postgis_topology');" | grep -qx "2"
+            docker exec "$c" psql -U postgres -c "CREATE EXTENSION IF NOT EXISTS vector;"
+          done
+          echo "boot assert passed on 16/17/18-postgis"
+
+      - name: Seeded 16->17 upgrade check
+        run: |
+          set -euo pipefail
+          docker run -d --name upsrc -e POSTGRES_PASSWORD=x -e POSTGRES_USER=postgres \
+            -e PGDATA=/var/lib/postgresql/data/pgdata \
+            -v up-vol:/var/lib/postgresql/data postgres-ssl-postgis:16-postgis
+          for _ in $(seq 1 30); do
+            docker exec upsrc pg_isready -U postgres >/dev/null 2>&1 && break
+            sleep 2
+          done
+          docker exec upsrc psql -U postgres -c \
+            "CREATE EXTENSION IF NOT EXISTS vector; CREATE TABLE geo(id serial primary key, g geometry(Point,4326), v vector(3)); INSERT INTO geo(g,v) VALUES ('SRID=4326;POINT(1 2)','[1,2,3]');"
+          docker stop upsrc
+          docker run --rm -e PGDATA=/var/lib/postgresql/data/pgdata -e POSTGRES_USER=postgres \
+            -v up-vol:/var/lib/postgresql/data postgres-upgrade-postgis:16-17 check
+
+      - name: Collect failure diagnostics
+        if: failure()
+        run: |
+          mkdir -p failure-artifacts
+          docker ps -a > failure-artifacts/docker-ps.txt 2>&1 || true
+          for c in smoke16 smoke17 smoke18 upsrc; do
+            docker logs --tail 200 "$c" > "failure-artifacts/container-${c}.log" 2>&1 || true
+          done
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-postgis-smoke-logs
+          path: failure-artifacts
+          retention-days: 14

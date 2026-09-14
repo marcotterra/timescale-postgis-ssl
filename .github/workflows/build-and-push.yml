@@ -26,6 +26,10 @@ env:
   # The single policy knob for which majors get (per-minor) builds. The
   # X.Y minors within each major are discovered per run, never hardcoded.
   POSTGRES_SUPPORTED_MAJORS: "13 14 15 16 17 18"
+  LATEST_POSTGIS_MAJOR: 18  # :latest-postgis points at :<this>-postgis
+  # PostGIS flavor (Q4, Debian only): PG major -> postgis/postgis tag.
+  # No minors exist upstream; the PG minor floats on every Monday rebuild
+  # (Q7), so flavor tags promise :<major>-postgis only.
 
 jobs:
   # Which postgres minors to build. Two sources, unioned (same scheme as
@@ -209,6 +213,110 @@ jobs:
           docker buildx imagetools create $tags "$SRC"
 
 
+  # PostGIS flavor (Q2/Q9/Q13): one image per supported PG major, published
+  # as :<major>-postgis (+ :latest-postgis on LATEST_POSTGIS_MAJOR). No
+  # minor discovery: upstream tags carry no PG minor and float weekly (Q7),
+  # so the content gate keys on the postgis base digest instead of a minor.
+  build-postgis:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { major: 16, postgis_tag: "16-3.5" }
+          - { major: 17, postgis_tag: "17-3.5" }
+          - { major: 18, postgis_tag: "18-3.6" }
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          platforms: linux/amd64,linux/arm64
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Same fail-open shape as the lean gate: gate errors build
+      # unconditionally rather than freezing the tag. Key = repo code that
+      # reaches the flavor image + postgis base digest + pending-fix set.
+      - name: Content gate
+        id: gate
+        run: |
+          set -o pipefail
+          IMG="ghcr.io/${{ github.repository }}"
+          TAG="${{ matrix.major }}-postgis"
+          BASE="postgis/postgis:${{ matrix.postgis_tag }}"
+
+          GATE_OK=true
+          CODE_KEY=$(git ls-tree HEAD | grep -E "\.sh$|Dockerfile\.postgis\.${{ matrix.major }}$" | sha256sum | cut -c1-16) || GATE_OK=false
+          BASE_DIGEST=$(docker buildx imagetools inspect "$BASE" --format '{{json .Manifest.Digest}}' | tr -d '"') || GATE_OK=false
+          docker pull -q "$BASE" >/dev/null || GATE_OK=false
+          PKG_KEY=$(docker run --rm "$BASE" bash -c "apt-get update -qq >/dev/null 2>&1; apt list --upgradable 2>/dev/null | sort" | sha256sum | cut -c1-16) || GATE_OK=false
+
+          if [ "$GATE_OK" != "true" ] || [ -z "$CODE_KEY" ] || [ -z "$BASE_DIGEST" ] || [ -z "$PKG_KEY" ]; then
+            echo "::warning::content gate failed for ${TAG}; building unconditionally"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "key=gate-error-${{ github.sha }}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          KEY=$(printf '%s\n' "$CODE_KEY" "$BASE_DIGEST" "$PKG_KEY" | sha256sum | cut -c1-32)
+          echo "key=$KEY" >> "$GITHUB_OUTPUT"
+
+          PUBLISHED_KEY=$(docker buildx imagetools inspect "$IMG:$TAG" --format '{{json .Image}}' 2>/dev/null \
+            | jq -r '(.config // .["linux/amd64"].config) | .Labels["railway.content-key"] // empty' 2>/dev/null || true)
+
+          if [ "${{ github.event.inputs.force || 'false' }}" = "true" ]; then
+            echo "force requested — building"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          elif [ "$KEY" = "$PUBLISHED_KEY" ]; then
+            echo "unchanged (key $KEY) — skipping build; digest stays put"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed (key $KEY, published ${PUBLISHED_KEY:-<none>}) — building"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and push with postgis tags
+        if: steps.gate.outputs.changed == 'true'
+        uses: docker/build-push-action@v5
+        with:
+          file: Dockerfile.postgis.${{ matrix.major }}
+          platforms: linux/arm64,linux/amd64
+          push: true
+          build-args: |
+            POSTGIS_BASE_TAG=${{ matrix.postgis_tag }}
+            PKG_REFRESH=${{ steps.gate.outputs.key }}
+          labels: |
+            railway.content-key=${{ steps.gate.outputs.key }}
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ matrix.major }}-postgis
+            ${{ matrix.major == env.LATEST_POSTGIS_MAJOR && format('ghcr.io/{0}:latest-postgis', github.repository) || '' }}
+
+      # Unchanged image: keep the :latest-postgis pointer current WITHOUT
+      # minting a new digest.
+      - name: Refresh latest-postgis pointer on unchanged image
+        if: steps.gate.outputs.changed == 'false' && matrix.major == env.LATEST_POSTGIS_MAJOR
+        run: |
+          IMG="ghcr.io/${{ github.repository }}"
+          docker buildx imagetools create -t "$IMG:latest-postgis" "$IMG:${{ matrix.major }}-postgis"
+
+
   # One image per (source, target) major pair, carrying both majors' server
   # binaries so pg_upgrade can drive both clusters. The dashboard's upgrade
   # workflow dispatches these by tag, so every pair a user can select must
@@ -312,3 +420,95 @@ jobs:
             railway.content-key=${{ steps.gate.outputs.key }}
           tags: |
             ghcr.io/${{ github.repository }}/upgrade:${{ matrix.from }}-${{ matrix.to }}
+
+  # PostGIS upgrade jobs (Q11/Q13): 16->17, 17->18, direct 16->18, each
+  # carrying both majors' postgres + postgis + pgvector so --check resolves
+  # spatial+vector libraries. POSTGIS_TO_TAG follows Q4 (17->17-3.5, 18->18-3.6).
+  build-upgrade-jobs-postgis:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { from: 16, to: 17, postgis_to_tag: "17-3.5" }
+          - { from: 17, to: 18, postgis_to_tag: "18-3.6" }
+          - { from: 16, to: 18, postgis_to_tag: "18-3.6" }
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          platforms: linux/amd64,linux/arm64
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Content gate
+        id: gate
+        run: |
+          set -o pipefail
+          IMG="ghcr.io/${{ github.repository }}/upgrade"
+          TAG="${{ matrix.from }}-${{ matrix.to }}-postgis"
+          BASE="postgis/postgis:${{ matrix.postgis_to_tag }}"
+
+          GATE_OK=true
+          CODE_KEY=$(git ls-tree HEAD | grep -E "\.sh$|Dockerfile\.upgrade\.postgis$" | sha256sum | cut -c1-16) || GATE_OK=false
+          BASE_DIGEST=$(docker buildx imagetools inspect "$BASE" --format '{{json .Manifest.Digest}}' | tr -d '"') || GATE_OK=false
+          docker pull -q "$BASE" >/dev/null || GATE_OK=false
+          PKG_KEY=$(docker run --rm "$BASE" bash -c "apt-get update -qq >/dev/null 2>&1; apt list --upgradable 2>/dev/null | sort" | sha256sum | cut -c1-16) || GATE_OK=false
+
+          if [ "$GATE_OK" != "true" ] || [ -z "$CODE_KEY" ] || [ -z "$BASE_DIGEST" ] || [ -z "$PKG_KEY" ]; then
+            echo "::warning::content gate failed for upgrade:${TAG}; building unconditionally"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "key=gate-error-${{ github.sha }}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          KEY=$(printf '%s\n' "$CODE_KEY" "$BASE_DIGEST" "$PKG_KEY" | sha256sum | cut -c1-32)
+          echo "key=$KEY" >> "$GITHUB_OUTPUT"
+
+          PUBLISHED_KEY=$(docker buildx imagetools inspect "$IMG:$TAG" --format '{{json .Image}}' 2>/dev/null \
+            | jq -r '(.config // .["linux/amd64"].config) | .Labels["railway.content-key"] // empty' 2>/dev/null || true)
+
+          if [ "${{ github.event.inputs.force || 'false' }}" = "true" ]; then
+            echo "force requested — building"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          elif [ "$KEY" = "$PUBLISHED_KEY" ]; then
+            echo "unchanged (key $KEY) — skipping build; digest stays put"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed (key $KEY, published ${PUBLISHED_KEY:-<none>}) — building"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and push the postgis upgrade job image
+        if: steps.gate.outputs.changed == 'true'
+        uses: docker/build-push-action@v5
+        with:
+          file: Dockerfile.upgrade.postgis
+          platforms: linux/arm64,linux/amd64
+          push: true
+          build-args: |
+            FROM_VERSION=${{ matrix.from }}
+            TO_VERSION=${{ matrix.to }}
+            POSTGIS_TO_TAG=${{ matrix.postgis_to_tag }}
+            PKG_REFRESH=${{ steps.gate.outputs.key }}
+          labels: |
+            railway.content-key=${{ steps.gate.outputs.key }}
+          tags: |
+            ghcr.io/${{ github.repository }}/upgrade:${{ matrix.from }}-${{ matrix.to }}-postgis

@@ -1,0 +1,104 @@
+ARG POSTGIS_BASE_TAG=16-3.5
+FROM postgis/postgis:${POSTGIS_BASE_TAG}
+# PostGIS flavor (-postgis tags): parallel opt-in to the lean postgres-ssl
+# images, PG 16-18 only. Per-major stable Debian pins (Q4): 16-3.5
+# (PostGIS 3.5.2, bullseye), 17-3.5, 18-3.6 (PostGIS 3.6.4, trixie).
+# Upstream tags carry NO PG minor and rebuild every Monday, so the PG minor
+# floats (Q7): these tags promise :<major>-postgis only, never :<minor>-postgis.
+# Extension packages are pinned AT THE MINOR: the volume keeps each
+# extension's SQL catalog at install-time version while the image carries
+# the .so, and this tag is rebuilt regularly - an unpinned package would let
+# pgdg move the binaries a whole minor (where catalog/.so compatibility
+# actually breaks) under every existing catalog overnight, with no gate
+# anywhere. PATCH releases and Debian packaging revisions float freely:
+# they are the bugfix/CVE stream and upstream keeps them
+# catalog-compatible (verified empirically 0.8.4->0.8.6). A MINOR bump is
+# the deliberate act: the scheduled bump workflow opens a one-line PR
+# moving this ARG, gated by the extension compat matrix (old catalogs
+# under the candidate .so). If pgdg ever prunes the whole minor from the
+# pool, the rebuild fails loudly - a human decides, never a nightly
+# accident.
+#
+# postgis/postgis pre-bundles PostGIS (postgis+topology auto-enabled via
+# initdb-postgis.sh, raster/sfcgal available) but NOT pgvector/pgbackrest/
+# tini — those are installed below exactly like the lean images (Q6 keeps
+# pgvector 0.8.* alongside PostGIS; Q8 keeps upstream auto-init as-is).
+ARG PGVECTOR_PKG_VERSION=0.8.*
+
+# Install OpenSSL, sudo, pgvector, pgbackrest, tini (PID 1, see ENTRYPOINT
+# below), and ca-certificates (needed
+# so pgbackrest can verify the TLS cert of the S3 endpoint — postgres base
+# image disables apt Recommends, so ca-certificates isn't pulled implicitly;
+# postgis layer already brings ca-certificates, re-listed idempotently)
+# CI passes its content key here (see the build workflow's content gate):
+# the value only changes when the repo code, the upstream base, or Debian's
+# pending-security-fix set moved, so this layer re-runs exactly when there
+# is something to pick up — and stays byte-cached (stable digest) otherwise.
+ARG PKG_REFRESH=none
+# apt-mark hold: the OS upgrade must never touch the packages that define
+# the bundled Postgres minor — PGDG always carries the major's newest minor,
+# so an unheld upgrade can make the image bundle a newer server than the
+# minor tag it publishes under. Everything else upgrades freely.
+# NOTE (Q7 float): the hold still guards OUR OWN apt upgrade layer, but it
+# cannot pin the PG minor the postgis BASE itself was built with — that
+# floats weekly upstream. Flavor tags document the float; lean :X.Y tags
+# keep their pinnable promise.
+# Bullseye note: NO `apt-get upgrade -y` on 16/17-postgis. The bullseye
+# security mirror 404s superseded packages (verified: libssl1.1, libc-l10n,
+# gnupg 404s on fresh `apt-get update`), so the upgrade layer cannot
+# complete on this suite — and failing the whole image build over unrelated
+# OS packages would block security delivery, not help it. OS fixes arrive
+# via upstream's Monday re-mint of the base + our digest-gated rebuild
+# (build-and-push `build-postgis` gate keys on the base digest), same
+# cadence as the base itself. The hold below still applies to the install
+# step so PGDG cannot move the bundled Postgres minor as a dependency.
+# 18-postgis (trixie, live suite) keeps `upgrade -y` like lean.
+# Bullseye openssl note: the base already ships openssl 1.1.1w (verified
+# /usr/bin/openssl present), and the bullseye-security copy of the u8
+# revision 404s, so requesting `openssl` here would fail the build over a
+# patch revision of a binary we already have. It is deliberately ABSENT
+# from the install list below (all other packages fetch fine); the guard
+# fails loudly if a future base ever drops it.
+RUN echo "refresh key: ${PKG_REFRESH}" \
+    && command -v openssl >/dev/null || (echo "postgis base lacks openssl; refusing" >&2; exit 1) \
+    && apt-mark hold postgresql-16 postgresql-client-16 \
+    && apt-get update \
+    && apt-get install -y sudo ca-certificates jq pgbackrest tini "postgresql-16-pgvector=${PGVECTOR_PKG_VERSION}" \
+    && apt-mark unhold postgresql-16 postgresql-client-16 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Allow the postgres user to execute certain commands as root without a password
+# Bullseye is NOT usr-merged (/bin/mkdir, /bin/chown; no /usr/bin twins),
+# while bookworm/trixie merge /bin -> /usr/bin — list both layouts so the
+# rule matches on either. init-ssl.sh resolves mkdir/chown via PATH.
+RUN echo "postgres ALL=(root) NOPASSWD: /usr/bin/mkdir, /bin/mkdir, /bin/chown, /usr/bin/chown, /usr/bin/openssl" > /etc/sudoers.d/postgres
+
+RUN install -d -m 0750 -o postgres -g postgres /etc/pgbackrest
+
+# Add init scripts while setting permissions
+# NOTE: postgis base already ships /docker-entrypoint-initdb.d/10_postgis.sh;
+# lexical order keeps ours stable: init-ssl.sh runs before 10_postgis.sh?
+# No — "10_" sorts before "init-ssl.sh", so PostGIS extensions initialize
+# first, then SSL + pgbackrest hooks. Order-independent by design: init-ssl
+# only touches certs/postgresql.conf ssl block, pgbackrest-init only touches
+# conf.d/pgbackrest.conf + repo-path marker; neither reads PostGIS catalogs.
+COPY --chmod=755 init-ssl.sh /docker-entrypoint-initdb.d/init-ssl.sh
+COPY --chmod=755 pgbackrest-init.sh /docker-entrypoint-initdb.d/99-pgbackrest-init.sh
+COPY --chmod=755 pgbackrest-archive-push-wrapper.sh /usr/local/bin/pgbackrest-archive-push-wrapper.sh
+COPY --chmod=755 pgbackrest-backup-watcher.sh /usr/local/bin/pgbackrest-backup-watcher.sh
+COPY --chmod=755 wrapper.sh /usr/local/bin/wrapper.sh
+
+# tini is PID 1. The runtime stops a container by signaling PID 1 only; a
+# shell there with no handler drops the signal, and the stop ends in SIGKILL
+# once the grace period runs out — every restart becomes a hard kill and the
+# next boot a WAL crash recovery. wrapper.sh cannot simply exec postgres
+# either: it forks background helpers (backup watcher, post-upgrade tasks)
+# that exec would re-parent onto the postmaster, which PANICs on their
+# SIGCHLD. tini -g delivers the stop signal to wrapper.sh's process group
+# (the wrapper and the postgres it runs in the foreground), reaps the
+# helpers when they exit, and exits with the wrapper's status. SIGINT is
+# postgres's fast-shutdown signal; the base image already declares it, and
+# it is restated here because the whole arrangement depends on it.
+STOPSIGNAL SIGINT
+ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/usr/local/bin/wrapper.sh"]
+CMD ["postgres", "-p", "5432", "-c", "listen_addresses=*"]

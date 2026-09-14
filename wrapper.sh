@@ -4,13 +4,35 @@
 set -e
 
 EXPECTED_VOLUME_MOUNT_PATH="/var/lib/postgresql/data"
+# PG18+ parent path (Q10b follow-upstream): postgis:18-3.6 (and upstream
+# postgres:18) default to PGDATA=/var/lib/postgresql/18/docker with
+# VOLUME /var/lib/postgresql. 16/17 flavors keep the legacy data-dir path.
+# The guard below accepts BOTH; EFFECTIVE_VOLUME_ROOT resolves per boot.
+VOLUME_PARENT_PATH="/var/lib/postgresql"
+
+# Resolve the volume root for lock/marker files: prefer the Railway mount
+# when set and valid, else derive from PGDATA (legacy when under the
+# data-dir path, else the parent), else fall back to legacy.
+resolve_volume_root() {
+  if [ -n "${RAILWAY_VOLUME_MOUNT_PATH:-}" ]; then
+    case "${RAILWAY_VOLUME_MOUNT_PATH}" in
+      "$EXPECTED_VOLUME_MOUNT_PATH"|"$VOLUME_PARENT_PATH") echo "$RAILWAY_VOLUME_MOUNT_PATH"; return 0 ;;
+    esac
+  fi
+  case "${PGDATA:-}" in
+    "$EXPECTED_VOLUME_MOUNT_PATH"*) echo "$EXPECTED_VOLUME_MOUNT_PATH"; return 0 ;;
+    "$VOLUME_PARENT_PATH"*) echo "$VOLUME_PARENT_PATH"; return 0 ;;
+  esac
+  echo "$EXPECTED_VOLUME_MOUNT_PATH"
+}
 
 # check if the Railway volume is mounted to the correct path
 # we do this by checking the current mount path (RAILWAY_VOLUME_MOUNT_PATH) agiant the expected mount path
 # if the paths are different, we print an error message and exit
 # only perform this check if this image is deployed to Railway by checking for the existence of the RAILWAY_ENVIRONMENT variable
-if [ -n "$RAILWAY_ENVIRONMENT" ] && [ "$RAILWAY_VOLUME_MOUNT_PATH" != "$EXPECTED_VOLUME_MOUNT_PATH" ]; then
-  echo "Railway volume not mounted to the correct path, expected $EXPECTED_VOLUME_MOUNT_PATH but got $RAILWAY_VOLUME_MOUNT_PATH"
+# Dual-path (Q10b): 16/17 mount the data dir, 18 mounts the parent.
+if [ -n "$RAILWAY_ENVIRONMENT" ] && [ "$RAILWAY_VOLUME_MOUNT_PATH" != "$EXPECTED_VOLUME_MOUNT_PATH" ] && [ "$RAILWAY_VOLUME_MOUNT_PATH" != "$VOLUME_PARENT_PATH" ]; then
+  echo "Railway volume not mounted to the correct path, expected $EXPECTED_VOLUME_MOUNT_PATH (PG 16/17) or $VOLUME_PARENT_PATH (PG 18+) but got $RAILWAY_VOLUME_MOUNT_PATH"
   echo "Please update the volume mount path to the expected path and redeploy the service"
   exit 1
 fi
@@ -26,11 +48,17 @@ export PGDATA
 # check if PGDATA starts with the expected volume mount path
 # this ensures data files are stored in the correct location
 # if not, print error and exit to prevent data loss or access issues
-if [[ ! "$PGDATA" =~ ^"$EXPECTED_VOLUME_MOUNT_PATH" ]]; then
-  echo "PGDATA variable does not start with the expected volume mount path, expected to start with $EXPECTED_VOLUME_MOUNT_PATH"
+# Dual-path (Q10b): PGDATA under legacy data-dir (16/17) or under the
+# parent (18+: .../18/docker). Parent prefix alone covers both since the
+# legacy path lives under it, but keep the explicit legacy mention in the
+# message so 16/17 operators see their familiar path.
+if [[ ! "$PGDATA" =~ ^"$VOLUME_PARENT_PATH" ]]; then
+  echo "PGDATA variable does not start with the expected volume mount path, expected to start with $EXPECTED_VOLUME_MOUNT_PATH (PG 16/17) or $VOLUME_PARENT_PATH (PG 18+)"
   echo "Please update the PGDATA variable to start with the expected volume mount path and redeploy the service"
   exit 1
 fi
+
+EFFECTIVE_VOLUME_ROOT="$(resolve_volume_root)"
 
 # -----------------------------------------------------------------------------
 # Volume-lifetime lock shared with the major-upgrade job. upgrade-job.sh
@@ -59,10 +87,10 @@ fi
 # it exists, so mixed-build runtime/job pairings keep excluding each other,
 # but it is never created here again.
 # -----------------------------------------------------------------------------
-UPGRADE_LOCK_FILE="$EXPECTED_VOLUME_MOUNT_PATH/.railway-volume.lock"
-LEGACY_UPGRADE_LOCK_FILE="$EXPECTED_VOLUME_MOUNT_PATH/.railway-major-upgrade.lock"
-if command -v flock >/dev/null 2>&1 && [ -d "$EXPECTED_VOLUME_MOUNT_PATH" ] \
-  && ! { [ "$PGDATA" = "$EXPECTED_VOLUME_MOUNT_PATH" ] && [ ! -f "$PGDATA/PG_VERSION" ]; }; then
+UPGRADE_LOCK_FILE="$EFFECTIVE_VOLUME_ROOT/.railway-volume.lock"
+LEGACY_UPGRADE_LOCK_FILE="$EFFECTIVE_VOLUME_ROOT/.railway-major-upgrade.lock"
+if command -v flock >/dev/null 2>&1 && [ -d "$EFFECTIVE_VOLUME_ROOT" ] \
+  && ! { [ "$PGDATA" = "$EFFECTIVE_VOLUME_ROOT" ] && [ ! -f "$PGDATA/PG_VERSION" ]; }; then
   # The 2>/dev/null MUST be scoped by the brace group, never put on the exec
   # itself: redirections on a bare `exec` are permanent for the shell, so
   # `exec 8>>file 2>/dev/null` would silence stderr for THIS SHELL AND
@@ -138,7 +166,7 @@ fi
 # inside an empty PGDATA-at-the-volume-root, or docker-entrypoint skips
 # initdb.
 # -----------------------------------------------------------------------------
-RUNTIME_LOCK_FILE="$EXPECTED_VOLUME_MOUNT_PATH/.railway-postgres-runtime.lock"
+RUNTIME_LOCK_FILE="$EFFECTIVE_VOLUME_ROOT/.railway-postgres-runtime.lock"
 RUNTIME_LOCK_WAIT_SECONDS="${RUNTIME_LOCK_WAIT_SECONDS:-300}"
 # Must be a whole number of seconds: `flock -w` rejects anything else with a
 # usage error, whose non-zero exit is indistinguishable from a hold timeout
@@ -151,8 +179,8 @@ case "$RUNTIME_LOCK_WAIT_SECONDS" in
     RUNTIME_LOCK_WAIT_SECONDS=300
     ;;
 esac
-if command -v flock >/dev/null 2>&1 && [ -d "$EXPECTED_VOLUME_MOUNT_PATH" ] \
-  && ! { [ "$PGDATA" = "$EXPECTED_VOLUME_MOUNT_PATH" ] && [ ! -f "$PGDATA/PG_VERSION" ]; }; then
+if command -v flock >/dev/null 2>&1 && [ -d "$EFFECTIVE_VOLUME_ROOT" ] \
+  && ! { [ "$PGDATA" = "$EFFECTIVE_VOLUME_ROOT" ] && [ ! -f "$PGDATA/PG_VERSION" ]; }; then
   # Brace-group-scoped stderr for the same reason as the upgrade lock above.
   if { exec 9>>"$RUNTIME_LOCK_FILE"; } 2>/dev/null; then
     if ! flock -n -x 9; then
@@ -182,17 +210,36 @@ fi
 #    names the actual problem and the fix. A fresh volume (no PG_VERSION)
 #    skips the check — that's first init.
 # -----------------------------------------------------------------------------
-UPGRADE_MARKER_FILE="$EXPECTED_VOLUME_MOUNT_PATH/.railway-major-upgrade.json"
-if [ -f "$UPGRADE_MARKER_FILE" ]; then
+UPGRADE_MARKER_FILE="$EFFECTIVE_VOLUME_ROOT/.railway-major-upgrade.json"
+# Cross-root upgrades (17 legacy root -> 18 parent root) leave the marker
+# and the .pre-upgrade-* stashes under the OTHER root: the job writes at the
+# service's pre-upgrade root while the next boot derives the post-upgrade
+# one. Resolve to the first root that actually carries a marker so every
+# downstream consumer (needsConfigReview, needsReindex, old-dir reclaim,
+# update_upgrade_marker) follows the upgrade instead of missing it. No
+# marker anywhere: keep EFFECTIVE (future writes land at the live root).
+for _marker_root in "$EFFECTIVE_VOLUME_ROOT" "$EXPECTED_VOLUME_MOUNT_PATH" "$VOLUME_PARENT_PATH"; do
+  if [ -f "$_marker_root/.railway-major-upgrade.json" ]; then
+    UPGRADE_MARKER_FILE="$_marker_root/.railway-major-upgrade.json"
+    break
+  fi
+done
+unset _marker_root
+# Cross-root upgrades (17 legacy root -> 18 parent root) write the marker
+# under a different root than the next boot derives. Check BOTH roots so a
+# mid-upgrade marker can never hide behind the root switch.
+for _marker_candidate in "$UPGRADE_MARKER_FILE" "$EXPECTED_VOLUME_MOUNT_PATH/.railway-major-upgrade.json" "$VOLUME_PARENT_PATH/.railway-major-upgrade.json"; do
+  [ -f "$_marker_candidate" ] || continue
   # `|| true` so an unreadable marker still lands in the fail-stop branch
   # below instead of tripping set -e with no message.
-  MARKER_PHASE=$(jq -r '.phase // empty' "$UPGRADE_MARKER_FILE" 2>/dev/null || true)
+  MARKER_PHASE=$(jq -r '.phase // empty' "$_marker_candidate" 2>/dev/null || true)
   if [ "$MARKER_PHASE" != "completed" ]; then
-    echo "A major version upgrade is in progress on this volume (marker phase: ${MARKER_PHASE:-unreadable})."
+    echo "A major version upgrade is in progress on this volume (marker $_marker_candidate phase: ${MARKER_PHASE:-unreadable})."
     echo "The database must not start until the upgrade workflow finishes or rolls back."
     exit 1
   fi
-fi
+done
+unset _marker_candidate
 
 # The marker above catches every phase pg_upgrade writes one for — but the
 # upgrade job only writes its FIRST marker on pg_upgrade's own success, so a
@@ -1016,7 +1063,7 @@ detect_cpus() {
 # returns 1024-byte blocks. Echoes 0 on any failure so callers can fall back
 # to the absolute defaults.
 detect_volume_total_kib() {
-  local vol_path="${RAILWAY_VOLUME_MOUNT_PATH:-$EXPECTED_VOLUME_MOUNT_PATH}"
+  local vol_path="${RAILWAY_VOLUME_MOUNT_PATH:-$EFFECTIVE_VOLUME_ROOT}"
   [ ! -d "$vol_path" ] && { echo 0; return; }
   df -Pk "$vol_path" 2>/dev/null | awk 'NR==2 { print $2 }' | grep -E '^[0-9]+$' || echo 0
 }
@@ -2043,9 +2090,20 @@ fork_post_upgrade_config_restore() {
     echo "post-upgrade: legacy upgrade marker (no stashedAutoConf field) — config-restore self-heal skipped; needsConfigReview stays set for the dashboard-driven flow"
     return 0
   fi
-  local from_major stash
+  local from_major stash _stash_root
   from_major="$(jq -r '.from // empty' "$UPGRADE_MARKER_FILE" 2>/dev/null)"
-  stash="$EXPECTED_VOLUME_MOUNT_PATH/.pre-upgrade-${from_major}-postgresql.auto.conf"
+  # The stash lives next to the marker the upgrade job wrote — which may be
+  # the other volume root on cross-root upgrades (17 legacy -> 18 parent).
+  # Derive sibling roots from the marker's own directory first, then both
+  # known roots, so a moved marker is still followed.
+  stash=""
+  for _stash_root in "$(dirname "$UPGRADE_MARKER_FILE")" "$EFFECTIVE_VOLUME_ROOT" "$EXPECTED_VOLUME_MOUNT_PATH" "$VOLUME_PARENT_PATH"; do
+    if [ -n "$from_major" ] && [ -f "$_stash_root/.pre-upgrade-${from_major}-postgresql.auto.conf" ]; then
+      stash="$_stash_root/.pre-upgrade-${from_major}-postgresql.auto.conf"
+      break
+    fi
+  done
+  unset _stash_root
   if [ -z "$from_major" ] || [ ! -f "$stash" ]; then
     # The upgrade marker records whether an auto.conf stash was expected
     # (stashedAutoConf). Missing-but-expected means the stash copy failed

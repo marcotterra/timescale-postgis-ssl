@@ -71,6 +71,47 @@ docker run ghcr.io/railwayapp-templates/postgres-ssl:17
 docker run ghcr.io/railwayapp-templates/postgres-ssl:17.6
 ```
 
+### PostGIS flavor (opt-in `-postgis` tags)
+
+Parallel images built `FROM postgis/postgis` (Debian only) for PG 16–18,
+ alongside the lean tags above — lean stays lean, spatial is opt-in:
+
+| Flavor tag | Base | PostGIS | PG minor |
+|---|---|---|---|
+| `:16-postgis` | `postgis/postgis:16-3.5` (bullseye) | 3.5.2 | floats weekly |
+| `:17-postgis` | `postgis/postgis:17-3.5` (bullseye) | 3.5.2 | floats weekly |
+| `:18-postgis` | `postgis/postgis:18-3.6` (trixie) | 3.6.4 | floats weekly |
+| `:latest-postgis` | → `:18-postgis` | | |
+
+```bash
+docker run ghcr.io/railwayapp-templates/postgres-ssl:17-postgis
+docker run ghcr.io/railwayapp-templates/postgres-ssl:18-postgis
+```
+
+Notes, all load-bearing:
+
+- **Float, not pin.** Upstream publishes no PG minor in the tag and
+  rebuilds every Monday, so `:17-postgis` floats its PG minor. There are no
+  `:17.6-postgis` tags and there never will be — pin lean `:17.6` when you
+  need a pinnable minor. `pgvector 0.8.*` is still installed alongside
+  PostGIS with the same minor-pin policy as lean.
+- **Extensions.** First init auto-enables `postgis` + `postgis_topology`
+  in `$POSTGRES_DB` (upstream `initdb-postgis.sh`, kept as-is) and provides
+  `template_postgis`; `postgis_raster` / `postgis_sfcgal` are available via
+  `CREATE EXTENSION`. PITR restores overwrite the datadir so the hook does
+  not rerun there.
+- **Volumes.** Follows upstream as-is: 16/17 mount
+  `/var/lib/postgresql/data` (e.g. `PGDATA=/var/lib/postgresql/data/pgdata`
+  in the Railway layout); 18 mounts `/var/lib/postgresql` (e.g.
+  `PGDATA=/var/lib/postgresql/18/docker`). The wrapper accepts both and the
+  upgrade marker is checked at both roots so cross-root 17→18 upgrades
+  cannot hide a mid-upgrade marker. Moving an old-path dump to 18 means
+  restructuring into the `PG_MAJOR/docker` layout first.
+- **Upgrades.** `upgrade:16-17-postgis`, `:17-18-postgis`, `:16-18-postgis`
+  carry both majors' `postgis` + `pgvector` so `--check` resolves spatial
+  and vector libraries; lean→`-postgis` same-major moves are dump/restore,
+  not `--link` across images.
+
 ### Point-in-time recovery (opt-in)
 
 The image ships with [pgBackRest](https://pgbackrest.org/) installed but

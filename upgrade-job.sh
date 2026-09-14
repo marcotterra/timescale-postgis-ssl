@@ -116,7 +116,16 @@ UPGRADE_QUIESCE_TIMEOUT_SECONDS="${UPGRADE_QUIESCE_TIMEOUT_SECONDS:-600}"
 UPGRADE_MIN_FREE_MB="${UPGRADE_MIN_FREE_MB:-512}"
 
 EXPECTED_VOLUME_MOUNT_PATH="/var/lib/postgresql/data"
+# PG18+ parent path (Q10b): 18 volumes mount /var/lib/postgresql with
+# PGDATA like /var/lib/postgresql/18/docker; 16/17 keep the data-dir mount.
+# VOLUME_ROOT resolves per run: Railway mount when valid, else PGDATA-derived.
+VOLUME_PARENT_PATH="/var/lib/postgresql"
 VOLUME_ROOT="$EXPECTED_VOLUME_MOUNT_PATH"
+if [ -n "${RAILWAY_VOLUME_MOUNT_PATH:-}" ]; then
+  case "${RAILWAY_VOLUME_MOUNT_PATH}" in
+    "$EXPECTED_VOLUME_MOUNT_PATH"|"$VOLUME_PARENT_PATH") VOLUME_ROOT="${RAILWAY_VOLUME_MOUNT_PATH}" ;;
+  esac
+fi
 # The dispatcher must pass the SERVICE's own PGDATA to this container. The
 # `:-` default below never applies in practice: the official postgres base
 # image this job is built FROM exports PGDATA=/var/lib/postgresql/data — the
@@ -132,6 +141,15 @@ PGDATA="${PGDATA:-$VOLUME_ROOT/pgdata}"
 # dir ("…/pgdata/.upgrade-17") — the swap's first rename then orphans it and
 # the volume wedges at phase=upgraded forever.
 while [ "${PGDATA%/}" != "$PGDATA" ] && [ -n "${PGDATA%/}" ]; do PGDATA="${PGDATA%/}"; done
+# Ad-hoc runs (no Railway env) derive the root from PGDATA: legacy when
+# under the data-dir path, else the parent (18+). Check legacy FIRST since
+# it lives under the parent prefix.
+if [ -z "${RAILWAY_VOLUME_MOUNT_PATH:-}" ]; then
+  case "$PGDATA" in
+    "$EXPECTED_VOLUME_MOUNT_PATH"*) VOLUME_ROOT="$EXPECTED_VOLUME_MOUNT_PATH" ;;
+    "$VOLUME_PARENT_PATH"*) VOLUME_ROOT="$VOLUME_PARENT_PATH" ;;
+  esac
+fi
 MARKER_FILE="$VOLUME_ROOT/.railway-major-upgrade.json"
 
 # The cluster's INSTALL user — pg_upgrade must connect as it, and the target
@@ -307,11 +325,11 @@ data_major() {
 # ----- preconditions ---------------------------------------------------------
 
 check_mount() {
-  if [ -n "${RAILWAY_ENVIRONMENT:-}" ] && [ "${RAILWAY_VOLUME_MOUNT_PATH:-}" != "$EXPECTED_VOLUME_MOUNT_PATH" ]; then
-    die 2 "Railway volume not mounted at $EXPECTED_VOLUME_MOUNT_PATH (got '${RAILWAY_VOLUME_MOUNT_PATH:-}')"
+  if [ -n "${RAILWAY_ENVIRONMENT:-}" ] && [ "${RAILWAY_VOLUME_MOUNT_PATH:-}" != "$EXPECTED_VOLUME_MOUNT_PATH" ] && [ "${RAILWAY_VOLUME_MOUNT_PATH:-}" != "$VOLUME_PARENT_PATH" ]; then
+    die 2 "Railway volume not mounted at $EXPECTED_VOLUME_MOUNT_PATH (PG 16/17) or $VOLUME_PARENT_PATH (PG 18+) (got '${RAILWAY_VOLUME_MOUNT_PATH:-}')"
   fi
-  if [[ ! "$PGDATA" =~ ^"$EXPECTED_VOLUME_MOUNT_PATH" ]]; then
-    die 2 "PGDATA ($PGDATA) is not under the volume mount path"
+  if [[ ! "$PGDATA" =~ ^"$VOLUME_PARENT_PATH" ]]; then
+    die 2 "PGDATA ($PGDATA) is not under the volume mount path ($EXPECTED_VOLUME_MOUNT_PATH or $VOLUME_PARENT_PATH)"
   fi
   # The new cluster dir lives NEXT TO the data dir and must share its
   # filesystem for --link's hardlinks; a PGDATA that IS the volume root has

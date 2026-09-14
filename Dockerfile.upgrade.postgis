@@ -1,0 +1,78 @@
+# Dual-binary one-shot upgrade job image for the PostGIS flavor: carries the
+# TARGET major as the postgis base plus the SOURCE major's server binaries,
+# so pg_upgrade can drive both clusters. Built per (FROM_VERSION, TO_VERSION)
+# pair for 16->17, 17->18, 16->18, e.g.:
+#
+#   docker build -f Dockerfile.upgrade.postgis \
+#     --build-arg FROM_VERSION=16 --build-arg TO_VERSION=17 \
+#     --build-arg POSTGIS_TO_TAG=17-3.5 \
+#     -t postgres-upgrade-postgis:16-17 .
+#
+# POSTGIS_TO_TAG mapping (Q4, Debian only): 17 -> 17-3.5, 18 -> 18-3.6.
+# (16 is never a TO in the supported pairs, but 16-3.5 is the valid value
+# if the matrix ever grows a ->16 pair.)
+#
+# The entrypoint (upgrade-job.sh, shared with lean) is the whole program:
+# check / upgrade / status / manifest / recover modes. It runs against the
+# database service's own volume while that service is stopped. Dual-path
+# volume roots (Q10b) are handled inside upgrade-job.sh itself.
+ARG POSTGIS_TO_TAG=17-3.5
+FROM postgis/postgis:${POSTGIS_TO_TAG}
+
+ARG FROM_VERSION=16
+ARG TO_VERSION
+ENV PG_UPGRADE_FROM=${FROM_VERSION}
+ENV PG_UPGRADE_TO=${TO_VERSION}
+
+# The postgis base's PGDG apt source is pinned to its own major's component;
+# widen it so the source major's packages resolve too. postgis + pgvector
+# install for BOTH majors: pg_upgrade starts the old server (its loaded
+# libraries must resolve) and the new cluster must be able to load every
+# library the old one references (postgis, pgvector), or --check fails with
+# "loadable libraries" errors (Q6/Q11).
+# CI content key (see the build workflow's content gate) — busts this layer
+# exactly when the repo code, the upstream base, or Debian's pending-fix set
+# moved, and keeps it byte-cached (stable digest) otherwise.
+#
+# Suite-mixing note (16->18): the base is trixie (PG18) while FROM=16's
+# packages resolve from the same trixie-pgdg suite. PGDG publishes every
+# supported major for every supported suite, so postgresql-16 + postgis-3
+# for trixie exist — but if PGDG ever drops that combination, this layer
+# fails loudly here (build time) rather than mid-upgrade.
+# No `apt-get upgrade -y` here: the 17-3.5 base is bullseye, whose security
+# mirror 404s superseded packages (same rot documented in
+# Dockerfile.postgis.16/17), and this is a one-shot job image — it runs
+# pg_upgrade while the database is stopped, then exits. OS fixes arrive via
+# upstream's Monday base re-mint + our digest-gated rebuild. The hold below
+# still guards the target major across the install step.
+ARG PKG_REFRESH=none
+RUN echo "refresh key: ${PKG_REFRESH}" \
+    && sed -ri "s/^(deb .*pgdg main).*$/\1 ${FROM_VERSION} ${TO_VERSION}/" /etc/apt/sources.list.d/pgdg.list \
+    && apt-get update \
+    # Hold the BASE image's installed PG packages (the target major) across
+    # the install step, the same invariant the runtime images enforce (#118).
+    # The source major is NOT installed in the base — it is installed after
+    # the hold — and holding a package that apt must still install makes
+    # its reverse-dependencies uninstallable ("not selected for install").
+    && apt-mark hold postgresql-${TO_VERSION} postgresql-client-${TO_VERSION} \
+    && apt-get install -y --no-install-recommends \
+      postgresql-${FROM_VERSION} \
+      postgresql-${FROM_VERSION}-pgvector \
+      postgresql-${TO_VERSION}-pgvector \
+      postgresql-${FROM_VERSION}-postgis-3 \
+      postgresql-${TO_VERSION}-postgis-3 \
+      jq \
+    && apt-mark unhold postgresql-${TO_VERSION} postgresql-client-${TO_VERSION} \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --chmod=755 upgrade-job.sh /usr/local/bin/upgrade-job.sh
+
+ENTRYPOINT ["upgrade-job.sh"]
+# Read-only default: production dispatch always sets UPGRADE_JOB_MODE, which
+# wins over this positional arg unconditionally (upgrade-job.sh resolves the
+# env var before ever looking at argv), so this CMD only matters for a bare
+# `docker run` with no mode specified — exactly the ad-hoc manual/incident-
+# response invocation the entrypoint's own mode-dispatch comments call out as
+# where a typo happens. Defaulting to the single most destructive mode there
+# is would be the one input this script's fail-stop design doesn't guard.
+CMD ["status"]

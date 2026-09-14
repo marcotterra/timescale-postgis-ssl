@@ -55,20 +55,24 @@ ARG PKG_REFRESH=none
 # cadence as the base itself. The hold below still applies to the install
 # step so PGDG cannot move the bundled Postgres minor as a dependency.
 # 18-postgis (trixie, live suite) keeps `upgrade -y` like lean.
-# The install below retries 3x with a fresh `apt-get update`: the mirror
-# desyncs intermittently (jq/sudo 404s observed), and a single attempt would
-# fail the build on a transient sync gap. Three consecutive failures still
-# fail loudly — this rides out desync, not a permanently gone package.
+# The install below retries 3x with a fresh `apt-get update` for transient
+# mirror desyncs. Separately, two files are PERMANENTLY gone from
+# bullseye-security (verified 2026-09-14: jq_1.6-2.1+deb11u3 and
+# sudo_1.9.5p2-3+deb11u4 404 on every attempt), so jq/sudo ride the
+# bullseye-main revisions that still fetch — jq=1.6-2.1 with its exact
+# libjq1=1.6-2.1 twin, sudo=1.9.5p2-3+deb11u1 — bump deliberately once the
+# pool is verified healthy. Exposure is narrow (jq parses JSON in shell;
+# sudo grants postgres NOPASSWD for mkdir/chown/openssl only).
 # Bullseye openssl note: the base already ships openssl 1.1.1w (verified
 # /usr/bin/openssl present), and the bullseye-security copy of the u8
 # revision 404s, so requesting `openssl` here would fail the build over a
 # patch revision of a binary we already have. It is deliberately ABSENT
-# from the install list below (all other packages fetch fine); the guard
-# fails loudly if a future base ever drops it.
+# from the install list below; the guard fails loudly if a future base
+# ever drops it.
 RUN echo "refresh key: ${PKG_REFRESH}" \
     && command -v openssl >/dev/null || (echo "postgis base lacks openssl; refusing" >&2; exit 1) \
     && apt-mark hold postgresql-17 postgresql-client-17 \
-    && (for i in 1 2 3; do apt-get update && apt-get install -y sudo ca-certificates jq pgbackrest tini "postgresql-17-pgvector=${PGVECTOR_PKG_VERSION}" && break; echo "apt attempt $i failed; retrying in 15s" >&2; [ "$i" -eq 3 ] && exit 1; sleep 15; done) \
+    && (for i in 1 2 3; do apt-get update && apt-get install -y sudo=1.9.5p2-3+deb11u1 ca-certificates jq=1.6-2.1 libjq1=1.6-2.1 pgbackrest tini "postgresql-17-pgvector=${PGVECTOR_PKG_VERSION}" && break; echo "apt attempt $i failed; retrying in 15s" >&2; [ "$i" -eq 3 ] && exit 1; sleep 15; done) \
     && apt-mark unhold postgresql-17 postgresql-client-17 \
     && rm -rf /var/lib/apt/lists/*
 

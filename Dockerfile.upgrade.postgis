@@ -45,15 +45,22 @@ ENV PG_UPGRADE_TO=${TO_VERSION}
 # pg_upgrade while the database is stopped, then exits. OS fixes arrive via
 # upstream's Monday base re-mint + our digest-gated rebuild. The hold below
 # still guards the target major across the install step.
+#
+# jq pin is suite-dependent: bullseye-security permanently 404s
+# jq_1.6-2.1+deb11u3, so TO=17 (bullseye base) pins jq/libjq1 to the
+# bullseye-main revisions; TO=18 (trixie, live mirror) floats. Which pairs
+# exist is fixed (16->17, 17->18, 16->18), so the branch is exact, not a
+# heuristic — an unknown TO fails loudly instead of guessing a suite.
 ARG PKG_REFRESH=none
+# Hold the BASE image's installed PG packages (the target major) across
+# the install step, the same invariant the runtime images enforce (#118).
+# The source major is NOT installed in the base — it is installed after
+# the hold — and holding a package that apt must still install makes
+# its reverse-dependencies uninstallable ("not selected for install").
 RUN echo "refresh key: ${PKG_REFRESH}" \
     && sed -ri "s/^(deb .*pgdg main).*$/\1 ${FROM_VERSION} ${TO_VERSION}/" /etc/apt/sources.list.d/pgdg.list \
     && apt-get update \
-    # Hold the BASE image's installed PG packages (the target major) across
-    # the install step, the same invariant the runtime images enforce (#118).
-    # The source major is NOT installed in the base — it is installed after
-    # the hold — and holding a package that apt must still install makes
-    # its reverse-dependencies uninstallable ("not selected for install").
+    && case "${TO_VERSION}" in 17) JQ_PKGS="jq=1.6-2.1 libjq1=1.6-2.1" ;; 18) JQ_PKGS="jq" ;; *) echo "unknown TO_VERSION=${TO_VERSION}; refusing (jq pin is suite-dependent)" >&2; exit 1 ;; esac \
     && apt-mark hold postgresql-${TO_VERSION} postgresql-client-${TO_VERSION} \
     && (for i in 1 2 3; do apt-get update && apt-get install -y --no-install-recommends \
       postgresql-${FROM_VERSION} \
@@ -61,7 +68,7 @@ RUN echo "refresh key: ${PKG_REFRESH}" \
       postgresql-${TO_VERSION}-pgvector \
       postgresql-${FROM_VERSION}-postgis-3 \
       postgresql-${TO_VERSION}-postgis-3 \
-      jq && break; echo "apt attempt $i failed; retrying in 15s" >&2; [ "$i" -eq 3 ] && exit 1; sleep 15; done) \
+      $JQ_PKGS && break; echo "apt attempt $i failed; retrying in 15s" >&2; [ "$i" -eq 3 ] && exit 1; sleep 15; done) \
     && apt-mark unhold postgresql-${TO_VERSION} postgresql-client-${TO_VERSION} \
     && rm -rf /var/lib/apt/lists/*
 

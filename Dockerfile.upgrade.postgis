@@ -55,13 +55,13 @@ RUN echo "refresh key: ${PKG_REFRESH}" \
     # the hold — and holding a package that apt must still install makes
     # its reverse-dependencies uninstallable ("not selected for install").
     && apt-mark hold postgresql-${TO_VERSION} postgresql-client-${TO_VERSION} \
-    && apt-get install -y --no-install-recommends \
+    && (for i in 1 2 3; do apt-get update && apt-get install -y --no-install-recommends \
       postgresql-${FROM_VERSION} \
       postgresql-${FROM_VERSION}-pgvector \
       postgresql-${TO_VERSION}-pgvector \
       postgresql-${FROM_VERSION}-postgis-3 \
       postgresql-${TO_VERSION}-postgis-3 \
-      jq \
+      jq && break; echo "apt attempt $i failed; retrying in 15s" >&2; [ "$i" -eq 3 ] && exit 1; sleep 15; done) \
     && apt-mark unhold postgresql-${TO_VERSION} postgresql-client-${TO_VERSION} \
     && rm -rf /var/lib/apt/lists/*
 

@@ -53,6 +53,10 @@ ARG PKG_REFRESH=none
 # cadence as the base itself. The hold below still applies to the install
 # step so PGDG cannot move the bundled Postgres minor as a dependency.
 # 18-postgis (trixie, live suite) keeps `upgrade -y` like lean.
+# The install below retries 3x with a fresh `apt-get update`: the mirror
+# desyncs intermittently (jq/sudo 404s observed), and a single attempt would
+# fail the build on a transient sync gap. Three consecutive failures still
+# fail loudly — this rides out desync, not a permanently gone package.
 # Bullseye openssl note: the base already ships openssl 1.1.1w (verified
 # /usr/bin/openssl present), and the bullseye-security copy of the u8
 # revision 404s, so requesting `openssl` here would fail the build over a
@@ -62,8 +66,7 @@ ARG PKG_REFRESH=none
 RUN echo "refresh key: ${PKG_REFRESH}" \
     && command -v openssl >/dev/null || (echo "postgis base lacks openssl; refusing" >&2; exit 1) \
     && apt-mark hold postgresql-16 postgresql-client-16 \
-    && apt-get update \
-    && apt-get install -y sudo ca-certificates jq pgbackrest tini "postgresql-16-pgvector=${PGVECTOR_PKG_VERSION}" \
+    && (for i in 1 2 3; do apt-get update && apt-get install -y sudo ca-certificates jq pgbackrest tini "postgresql-16-pgvector=${PGVECTOR_PKG_VERSION}" && break; echo "apt attempt $i failed; retrying in 15s" >&2; [ "$i" -eq 3 ] && exit 1; sleep 15; done) \
     && apt-mark unhold postgresql-16 postgresql-client-16 \
     && rm -rf /var/lib/apt/lists/*
 

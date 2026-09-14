@@ -234,7 +234,10 @@ for _marker_candidate in "$UPGRADE_MARKER_FILE" "$EXPECTED_VOLUME_MOUNT_PATH/.ra
   # below instead of tripping set -e with no message.
   MARKER_PHASE=$(jq -r '.phase // empty' "$_marker_candidate" 2>/dev/null || true)
   if [ "$MARKER_PHASE" != "completed" ]; then
-    echo "A major version upgrade is in progress on this volume (marker $_marker_candidate phase: ${MARKER_PHASE:-unreadable})."
+    # Message shape is asserted by test/e2e-upgrade.sh t_boot_refused_mid_upgrade
+    # ("marker phase: ...") — keep it byte-identical; the multi-root loop
+    # must not interpolate the candidate path here.
+    echo "A major version upgrade is in progress on this volume (marker phase: ${MARKER_PHASE:-unreadable})."
     echo "The database must not start until the upgrade workflow finishes or rolls back."
     exit 1
   fi

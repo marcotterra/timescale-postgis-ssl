@@ -115,7 +115,10 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           file: Dockerfile.postgis.${{ matrix.major }}
-          platforms: linux/arm64,linux/amd64
+          # amd64 only: postgis/postgis publishes no arm64 manifest
+          # (upstream documents x86-64), so a dual-platform build cannot
+          # even resolve the base. Revisit if upstream ships multi-arch.
+          platforms: linux/amd64
           push: true
           build-args: |
             POSTGIS_BASE_TAG=${{ matrix.postgis_tag }}

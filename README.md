@@ -68,6 +68,18 @@ docker run ghcr.io/marcotterra/timescale-postgis-ssl:17-postgis
 docker run ghcr.io/marcotterra/timescale-postgis-ssl:18-postgis
 ```
 
+> **amd64 only.** Upstream `postgis/postgis` publishes no arm64 manifest,
+> so neither do these images. On Apple Silicon / ARM hosts pull and run
+> with explicit platform emulation:
+>
+> ```bash
+> docker pull --platform linux/amd64 ghcr.io/marcotterra/timescale-postgis-ssl:17-postgis
+> docker run --platform linux/amd64 ghcr.io/marcotterra/timescale-postgis-ssl:17-postgis
+> ```
+>
+> Production (amd64) is unaffected. Native arm64 would require compiling
+> PostGIS from source instead of `FROM postgis/postgis` — not planned.
+
 Notes, all load-bearing:
 
 - **Float, not pin.** Upstream publishes no PG minor in the tag and

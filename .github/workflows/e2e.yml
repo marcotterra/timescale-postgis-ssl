@@ -15,9 +15,10 @@ permissions:
 jobs:
   # PostGIS flavor smoke (Q14 gate, MinIO-free): boots each -postgis image,
   # asserts ssl + postgis/topology auto-init + vector installable, then runs
-  # a seeded 16->17 upgrade check with the postgis upgrade image. Full
-  # MinIO PITR coverage on the flavor (flavor tags + the 18 parent mount)
-  # is the open follow-up — not silently claimed here.
+  # seeded upgrade checks for all three pairs (16->17, 17->18, direct 16->18)
+  # with the postgis upgrade images. Full MinIO PITR coverage on the flavor
+  # (flavor tags + the 18 parent mount) is the open follow-up — not silently
+  # claimed here.
   e2e-postgis-smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -42,6 +43,14 @@ jobs:
             --build-arg FROM_VERSION=16 --build-arg TO_VERSION=17 \
             --build-arg POSTGIS_TO_TAG=17-3.5 \
             -t postgres-upgrade-postgis:16-17 .
+          docker build -f Dockerfile.upgrade.postgis \
+            --build-arg FROM_VERSION=17 --build-arg TO_VERSION=18 \
+            --build-arg POSTGIS_TO_TAG=18-3.6 \
+            -t postgres-upgrade-postgis:17-18 .
+          docker build -f Dockerfile.upgrade.postgis \
+            --build-arg FROM_VERSION=16 --build-arg TO_VERSION=18 \
+            --build-arg POSTGIS_TO_TAG=18-3.6 \
+            -t postgres-upgrade-postgis:16-18 .
 
       - name: Boot assert (ssl + postgis + vector)
         run: |
@@ -71,28 +80,40 @@ jobs:
           done
           echo "boot assert passed on 16/17/18-postgis"
 
-      - name: Seeded 16->17 upgrade check
+      - name: Seeded upgrade checks (16->17, 17->18, 16->18)
         run: |
           set -euo pipefail
-          docker run -d --name upsrc -e POSTGRES_PASSWORD=x -e POSTGRES_USER=postgres \
-            -e PGDATA=/var/lib/postgresql/data/pgdata \
-            -v up-vol:/var/lib/postgresql/data postgres-ssl-postgis:16-postgis
-          for _ in $(seq 1 30); do
-            docker exec upsrc pg_isready -U postgres >/dev/null 2>&1 && break
-            sleep 2
-          done
-          docker exec upsrc psql -U postgres -c \
-            "CREATE EXTENSION IF NOT EXISTS vector; CREATE TABLE geo(id serial primary key, g geometry(Point,4326), v vector(3)); INSERT INTO geo(g,v) VALUES ('SRID=4326;POINT(1 2)','[1,2,3]');"
-          docker stop upsrc
-          docker run --rm -e PGDATA=/var/lib/postgresql/data/pgdata -e POSTGRES_USER=postgres \
-            -v up-vol:/var/lib/postgresql/data postgres-upgrade-postgis:16-17 check
+          # Sources are always pre-upgrade majors, so every volume uses the
+          # legacy data-dir layout; the 17->18 cross-root switch only matters
+          # for real upgrades, not for check mode.
+          check_pair() {
+            local from="$1" to="$2"
+            local src="upsrc-${from}-${to}" vol="up-vol-${from}-${to}"
+            docker volume create "$vol" >/dev/null
+            docker run -d --name "$src" -e POSTGRES_PASSWORD=x -e POSTGRES_USER=postgres \
+              -e PGDATA=/var/lib/postgresql/data/pgdata \
+              -v "$vol:/var/lib/postgresql/data" "postgres-ssl-postgis:${from}-postgis"
+            for _ in $(seq 1 30); do
+              docker exec "$src" pg_isready -U postgres >/dev/null 2>&1 && break
+              sleep 2
+            done
+            docker exec "$src" psql -U postgres -c \
+              "CREATE EXTENSION IF NOT EXISTS vector; CREATE TABLE geo(id serial primary key, g geometry(Point,4326), v vector(3)); INSERT INTO geo(g,v) VALUES ('SRID=4326;POINT(1 2)','[1,2,3]');"
+            docker stop "$src" >/dev/null
+            docker run --rm -e PGDATA=/var/lib/postgresql/data/pgdata -e POSTGRES_USER=postgres \
+              -v "$vol:/var/lib/postgresql/data" "postgres-upgrade-postgis:${from}-${to}" check
+            echo "upgrade check passed for ${from}->${to}"
+          }
+          check_pair 16 17
+          check_pair 17 18
+          check_pair 16 18
 
       - name: Collect failure diagnostics
         if: failure()
         run: |
           mkdir -p failure-artifacts
           docker ps -a > failure-artifacts/docker-ps.txt 2>&1 || true
-          for c in smoke16 smoke17 smoke18 upsrc; do
+          for c in smoke16 smoke17 smoke18 upsrc-16-17 upsrc-17-18 upsrc-16-18; do
             docker logs --tail 200 "$c" > "failure-artifacts/container-${c}.log" 2>&1 || true
           done
 

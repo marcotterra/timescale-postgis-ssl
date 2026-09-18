@@ -1,9 +1,9 @@
 #!/bin/bash
 # upgrade-job.sh — one-shot in-place major upgrade job (pg_upgrade --link).
 #
-# Runs as the entrypoint of the dual-binary upgrade image (Dockerfile.upgrade),
-# against the SAME volume the database service owns, while that service is
-# stopped. The orchestrating workflow guarantees exclusivity (volume lock +
+# Runs as the entrypoint of the dual-binary upgrade image
+# (Dockerfile.upgrade.postgis), against the SAME volume the database service
+# owns, while that service is stopped. The orchestrating workflow guarantees exclusivity (volume lock +
 # service maintenance lock); this script still refuses the obvious hazards.
 #
 # Modes (UPGRADE_JOB_MODE env var; falls back to a positional arg for local/

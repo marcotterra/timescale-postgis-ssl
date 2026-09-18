@@ -18,9 +18,10 @@ enabled right out of the box.
 
 ### How does it work?
 
-The Dockerfiles contained in this repository start with the official Postgres
-image as base. Then the `init-ssl.sh` script is copied into the
-`docker-entrypoint-initdb.d/` directory to be executed upon initialization.
+The Dockerfiles contained in this repository start with the PostGIS
+image (`postgis/postgis`) as base. Then the `init-ssl.sh` script is copied
+into the `docker-entrypoint-initdb.d/` directory to be executed upon
+initialization (after PostGIS's own `10_postgis.sh`).
 
 ### Certificate expiry
 
@@ -52,31 +53,10 @@ volume-lock and pgBackRest warnings from `wrapper.sh` stay on stderr.
 
 ### Available image tags
 
-Images are automatically built weekly and tagged with multiple version levels
-for flexibility:
+Images are automatically built daily and tagged per PostgreSQL major.
+Every image is PostGIS-enabled (built `FROM postgis/postgis`, Debian only):
 
-- **Major version tags** (e.g., `:17`, `:16`, `:15`): Always points to the
-  latest minor version for that major release
-- **Minor version tags** (e.g., `:17.6`, `:16.10`): Pins to specific minor
-  version for stability
-- **Latest tag** (`:latest`): Currently points to PostgreSQL 16
-
-Example usage:
-
-```bash
-# Auto-update to latest minor versions (recommended for development)
-docker run ghcr.io/railwayapp-templates/postgres-ssl:17
-
-# Pin to specific minor version (recommended for production)
-docker run ghcr.io/railwayapp-templates/postgres-ssl:17.6
-```
-
-### PostGIS flavor (opt-in `-postgis` tags)
-
-Parallel images built `FROM postgis/postgis` (Debian only) for PG 16–18,
- alongside the lean tags above — lean stays lean, spatial is opt-in:
-
-| Flavor tag | Base | PostGIS | PG minor |
+| Tag | Base | PostGIS | PG minor |
 |---|---|---|---|
 | `:16-postgis` | `postgis/postgis:16-3.5` (bullseye) | 3.5.2 | floats weekly |
 | `:17-postgis` | `postgis/postgis:17-3.5` (bullseye) | 3.5.2 | floats weekly |
@@ -84,17 +64,16 @@ Parallel images built `FROM postgis/postgis` (Debian only) for PG 16–18,
 | `:latest-postgis` | → `:18-postgis` | | |
 
 ```bash
-docker run ghcr.io/railwayapp-templates/postgres-ssl:17-postgis
-docker run ghcr.io/railwayapp-templates/postgres-ssl:18-postgis
+docker run ghcr.io/marcotterra/timescale-postgis-ssl:17-postgis
+docker run ghcr.io/marcotterra/timescale-postgis-ssl:18-postgis
 ```
 
 Notes, all load-bearing:
 
 - **Float, not pin.** Upstream publishes no PG minor in the tag and
   rebuilds every Monday, so `:17-postgis` floats its PG minor. There are no
-  `:17.6-postgis` tags and there never will be — pin lean `:17.6` when you
-  need a pinnable minor. `pgvector 0.8.*` is still installed alongside
-  PostGIS with the same minor-pin policy as lean.
+  `:17.6-postgis` tags and there never will be. `pgvector 0.8.*` is still
+  installed alongside PostGIS with a minor-pin policy.
 - **Extensions.** First init auto-enables `postgis` + `postgis_topology`
   in `$POSTGRES_DB` (upstream `initdb-postgis.sh`, kept as-is) and provides
   `template_postgis`; `postgis_raster` / `postgis_sfcgal` are available via
@@ -107,10 +86,10 @@ Notes, all load-bearing:
   upgrade marker is checked at both roots so cross-root 17→18 upgrades
   cannot hide a mid-upgrade marker. Moving an old-path dump to 18 means
   restructuring into the `PG_MAJOR/docker` layout first.
-- **Upgrades.** `upgrade:16-17-postgis`, `:17-18-postgis`, `:16-18-postgis`
-  carry both majors' `postgis` + `pgvector` so `--check` resolves spatial
-  and vector libraries; lean→`-postgis` same-major moves are dump/restore,
-  not `--link` across images.
+- **Upgrades.** `Dockerfile.upgrade.postgis` (16→17, 17→18, 16→18)
+  carries both majors' `postgis` + `pgvector` so `--check` resolves spatial
+  and vector libraries. Same-major moves across different images are
+  dump/restore, not `--link`.
 
 ### Point-in-time recovery (opt-in)
 
@@ -427,16 +406,18 @@ change this behavior, feel free to build your own image without passing the
 
 ## Major version upgrades
 
-`Dockerfile.upgrade` builds a one-shot job image carrying two majors' server
-binaries, driven by `upgrade-job.sh`. CI publishes one image per supported
-(source → newer target) pair as
-`ghcr.io/railwayapp-templates/postgres-ssl/upgrade:<from>-<to>`, which is what
-the dashboard's upgrade workflow dispatches. Locally:
+`Dockerfile.upgrade.postgis` builds a one-shot job image carrying two
+majors' server binaries (plus both majors' PostGIS and pgvector libraries),
+driven by `upgrade-job.sh`. Supported pairs are 16→17, 17→18, and direct
+16→18. The upgrade images are defined in-repo but not currently published
+by CI — the `e2e-postgis-smoke` workflow builds the 16→17 image and runs a
+seeded upgrade check on every run. Locally:
 
 ```bash
-docker build -f Dockerfile.upgrade \
+docker build -f Dockerfile.upgrade.postgis \
   --build-arg FROM_VERSION=16 --build-arg TO_VERSION=17 \
-  -t postgres-upgrade:16-17 .
+  --build-arg POSTGIS_TO_TAG=17-3.5 \
+  -t postgres-upgrade-postgis:16-17 .
 ```
 
 It runs against the database's own volume while the service is stopped, and
@@ -444,7 +425,7 @@ selects its mode from the `UPGRADE_JOB_MODE` env var — never `startCommand`
 or a positional arg, which the dispatcher (railwayapp/mono#34384) can't rely
 on: Railway's two container runtimes disagree on how a deployment's
 `startCommand` composes with the image's own `ENTRYPOINT`. A positional arg
-still works for local/manual runs and the e2e harness, which invoke the
+still works for local/manual runs, which invoke the
 script directly, but only as a fallback — an env var takes priority, and an
 unrecognized positional arg refuses rather than silently defaulting to
 `upgrade`:
@@ -719,10 +700,9 @@ nothing new — see `ensure_clean_shutdown`'s docblock). The pre-upgrade
 backup this feature always takes is what covers that point, not the old
 archive.
 
-Tests: `./test/e2e-upgrade.sh` (add `FROM_VERSION=14 TO_VERSION=17` to cover a
-pre-16 source, where pg_upgrade's `reg*`/`aclitem` checks fire). CI runs the
-harness on 16→17 and 17→18 — the latter pins the initdb data-checksums
-default flip in 18, which needs explicit parity flags. The re-anchor
-tests need a bucket, so they live in the archive harness instead:
-`./test/e2e.sh t_upgrade_archive_reanchors_to_new_cluster_path
-t_reanchor_stale_marker_after_upgrade t_reanchor_backfills_missing_anchor`.
+Tests: the `e2e-postgis-smoke` CI job builds all three flavor images,
+boots each (asserting SSL, PostGIS auto-init, and vector), and runs a
+seeded 16→17 upgrade `check` with the postgis upgrade image — MinIO-free,
+no full PITR harness. WAL-archiving PITR flows on the flavor remain
+uncovered; parameterizing a MinIO harness for the flavor tags and the 18
+parent mount is the open follow-up.

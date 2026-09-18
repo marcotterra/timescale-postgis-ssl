@@ -15,10 +15,9 @@ permissions:
 jobs:
   # PostGIS flavor smoke (Q14 gate, MinIO-free): boots each -postgis image,
   # asserts ssl + postgis/topology auto-init + vector installable, then runs
-  # a seeded 16->17 upgrade check with the postgis upgrade image. The full
-  # MinIO PITR suite (test/e2e.sh) stays lean-only until it is parameterized
-  # for flavor tags and the 18 parent mount — tracked as follow-up, not
-  # silently claimed here.
+  # a seeded 16->17 upgrade check with the postgis upgrade image. Full
+  # MinIO PITR coverage on the flavor (flavor tags + the 18 parent mount)
+  # is the open follow-up — not silently claimed here.
   e2e-postgis-smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 60

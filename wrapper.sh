@@ -234,9 +234,9 @@ for _marker_candidate in "$UPGRADE_MARKER_FILE" "$EXPECTED_VOLUME_MOUNT_PATH/.ra
   # below instead of tripping set -e with no message.
   MARKER_PHASE=$(jq -r '.phase // empty' "$_marker_candidate" 2>/dev/null || true)
   if [ "$MARKER_PHASE" != "completed" ]; then
-    # Message shape is asserted by test/e2e-upgrade.sh t_boot_refused_mid_upgrade
-    # ("marker phase: ...") — keep it byte-identical; the multi-root loop
-    # must not interpolate the candidate path here.
+    # Boot-refusal contract ("marker phase: ..."): keep the message
+    # byte-identical — external monitors may scrape it, and the multi-root
+    # loop must not interpolate the candidate path here.
     echo "A major version upgrade is in progress on this volume (marker phase: ${MARKER_PHASE:-unreadable})."
     echo "The database must not start until the upgrade workflow finishes or rolls back."
     exit 1
@@ -2600,7 +2600,8 @@ trap 'STOP_REQUESTED=1' TERM INT
 # sets it as a service variable, so "no references here" is the contract
 # working, not dead code (#72 read it the other way and dropped the branch;
 # issue #135 is the user whose Postgres logs it took away). Both streams
-# are pinned by t_log_to_stdout_moves_server_stream in test/e2e.sh.
+# keep their documented assignment (server log to stdout iff LOG_TO_STDOUT,
+# diagnostics to stderr always).
 #
 # The redirect is deliberately narrow: it lands past every `>&2` diagnostic
 # above and past the forked watchers (which keep the fds they were forked
